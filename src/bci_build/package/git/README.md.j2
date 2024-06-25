@@ -1,0 +1,26 @@
+# {{ image.pretty_name }} container image
+
+{% include 'badges.j2' %}
+
+## Description
+
+A micro environment with Git based on the SLE Base Container Image.
+
+## Usage
+
+To run Git use the following command:
+
+```ShellSession
+$ podman run --rm -it -v ${HOME}:/root -v $(pwd):/git {{ image.pretty_reference }} <git-sub-command>
+```
+
+For example if you need clone a repository, you can run
+```ShellSession
+$ podman run --rm -it -v ${HOME}:/root -v $(pwd):/git {{ image.pretty_reference }} clone https://github.com/username/repository-name.git
+```
+
+### Optional usage:
+```ShellSession
+$ alias git="podman run --rm -it -v $(pwd):/git -v $HOME/.ssh:/root/.ssh {{ image.pretty_reference }}"
+```
+{% include 'licensing_and_eula.j2' %}

@@ -443,9 +443,11 @@ GIT_CONTAINERS = [
             )
             + (() if os_version == OsVersion.TUMBLEWEED else ("skelcd-EULA-bci",))
         ],
-        # intentionally empty
-        config_sh_script="""
-""",
+        volumes=["/git"],
+        entrypoint=["/usr/bin/git"],
+        cmd=["help"],
+        custom_end="""WORKDIR /git
+        """,
     )
     for os_version in ALL_NONBASE_OS_VERSIONS
 ]
