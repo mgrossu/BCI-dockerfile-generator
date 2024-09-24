@@ -20,10 +20,11 @@ jobs:
       fail-fast: false
       matrix:
         os_version:
+          - 7
           - 6
           - 5
+          - "16.0"
           - Tumbleweed
-          - Basalt
 
     steps:
       - uses: actions/checkout@v4

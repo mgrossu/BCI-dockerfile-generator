@@ -29,7 +29,6 @@ MICRO_CONTAINERS = [
         os_version=os_version,
         support_level=SupportLevel.L3,
         supported_until=_SUPPORTED_UNTIL_SLE.get(os_version),
-        package_name="micro-image",
         logo_url="https://opensource.suse.com/bci/SLE_BCI_logomark_green.svg",
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         pretty_name=f"{os_version.pretty_os_version_no_dash} Micro",
@@ -64,12 +63,11 @@ INIT_CONTAINERS = [
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         pretty_name=f"{os_version.pretty_os_version_no_dash} Init",
         custom_description="Systemd environment for containers {based_on_container}. {podman_only}",
-        package_list=["systemd", "gzip"],
+        package_list=["systemd", "gzip", *os_version.release_package_names],
         cmd=["/usr/lib/systemd/systemd"],
         extra_labels={
             "usage": "This container should only be used to build containers for daemons. Add your packages and enable services using systemctl."
         },
-        package_name="init-image",
         logo_url="https://opensource.suse.com/bci/SLE_BCI_logomark_green.svg",
         custom_end=textwrap.dedent(
             f"""
@@ -84,10 +82,11 @@ INIT_CONTAINERS = [
     for os_version in ALL_BASE_OS_VERSIONS
 ]
 
+_FIPS_ASSET_BASEURL = "https://api.opensuse.org/public/build/"
+
 # https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp3991.pdf
 # Chapter 9.1 Crypto Officer Guidance
-_FIPS_15_SP2_ASSET_BASEURL = "https://api.opensuse.org/public/build/"
-_FIPS_15_SP2_BINARIES = [
+_FIPS_15_SP2_BINARIES: list[str] = [
     f"SUSE:SLE-15-SP2:Update/pool/x86_64/openssl-1_1.18804/{name}-1.1.1d-11.20.1.x86_64.rpm"
     for name in ("openssl-1_1", "libopenssl1_1", "libopenssl1_1-hmac")
 ] + [
@@ -95,40 +94,103 @@ _FIPS_15_SP2_BINARIES = [
     for name in ("libgcrypt20", "libgcrypt20-hmac")
 ]
 
+# submitted, not yet certified
+_FIPS_15_SP4_BINARIES: list[str] = [
+    f"SUSE:SLE-15-SP4:Update/pool/x86_64/openssl-1_1.28168/{name}-1.1.1l-150400.7.28.1.x86_64.rpm"
+    for name in ("openssl-1_1", "libopenssl1_1", "libopenssl1_1-hmac")
+] + [
+    f"SUSE:SLE-15-SP4:Update/pool/x86_64/libgcrypt.28151/{name}-1.9.4-150400.6.8.1.x86_64.rpm"
+    for name in ("libgcrypt20", "libgcrypt20-hmac")
+]
+
+
+def _get_fips_base_custom_end(os_version: OsVersion) -> str:
+    bins: list[str] = []
+    custom_set_fips_mode: str = (
+        f"{DOCKERFILE_RUN} update-crypto-policies --no-reload --set FIPS\n"
+    )
+    match os_version:
+        case OsVersion.SP3:
+            bins = _FIPS_15_SP2_BINARIES
+        case OsVersion.SP4:
+            bins = _FIPS_15_SP4_BINARIES
+        case OsVersion.SP5 | OsVersion.SP6:
+            pass
+        case _:
+            raise NotImplementedError(f"Unsupported os_version: {os_version}")
+
+    custom_install_bins: str = textwrap.dedent(
+        f"""
+            {DOCKERFILE_RUN} \\
+                [ $(LC_ALL=C rpm --checksig -v *rpm | \\
+                    grep -c -E "^ *V3.*key ID 39db7c82: OK") = {len(bins)} ] \\
+                && rpm -Uvh --oldpackage --force *.rpm \\
+                && rm -vf *.rpm \\
+                && rpmqpack | grep -E '(openssl|libgcrypt)' | xargs zypper -n addlock\n"""
+    )
+
+    return (
+        "".join(
+            f"#!RemoteAssetUrl: {_FIPS_ASSET_BASEURL}{binary}\nCOPY {os.path.basename(binary)} .\n"
+            for binary in bins
+        ).strip()
+        + (custom_install_bins if bins else "")
+        + (custom_set_fips_mode if os_version not in (OsVersion.SP3,) else "")
+    )
+
+
+def _get_fips_pretty_name(os_version: OsVersion) -> str:
+    match os_version:
+        case OsVersion.SP3:
+            return f"{os_version.pretty_os_version_no_dash} FIPS-140-2"
+        case OsVersion.SP4 | OsVersion.SP5 | OsVersion.SP6:
+            return f"{os_version.pretty_os_version_no_dash} FIPS-140-3"
+        case _:
+            raise NotImplementedError(f"Unsupported os_version: {os_version}")
+
+
+def _get_supported_until_fips(os_version: OsVersion) -> datetime.date:
+    """Returns the end of LTSS for images under LTSS, otherwise end of general support if known"""
+    match os_version:
+        case OsVersion.SP3:
+            return datetime.date(2025, 12, 31)
+        case OsVersion.SP4:
+            return datetime.date(2026, 12, 31)
+        case _:
+            return _SUPPORTED_UNTIL_SLE.get(os_version)
+
+
 FIPS_BASE_CONTAINERS = [
     OsContainer(
         name="base-fips",
-        package_name="base-fips-image",
-        exclusive_arch=[Arch.X86_64],
+        exclusive_arch=[Arch.X86_64] if os_version.is_ltss else None,
         os_version=os_version,
         build_recipe_type=BuildType.DOCKER,
         support_level=SupportLevel.L3,
-        supported_until=datetime.date(2025, 12, 31),
+        supported_until=_get_supported_until_fips(os_version),
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        pretty_name=f"{os_version.pretty_os_version_no_dash} FIPS-140-2",
-        package_list=["fipscheck", "sles-ltss-release"],
+        pretty_name=_get_fips_pretty_name(os_version),
+        package_list=[*os_version.release_package_names, "coreutils"]
+        + (
+            ["fipscheck"]
+            if os_version == OsVersion.SP3
+            else ["crypto-policies-scripts"]
+        ),
         extra_labels={
             "usage": "This container should only be used on a FIPS enabled host (fips=1 on kernel cmdline)."
         },
-        custom_end="".join(
-            f"#!RemoteAssetUrl: {_FIPS_15_SP2_ASSET_BASEURL}{binary}\nCOPY {os.path.basename(binary)} .\n"
-            for binary in _FIPS_15_SP2_BINARIES
-        ).strip()
+        custom_end=_get_fips_base_custom_end(os_version)
         + textwrap.dedent(
-            f"""
-            {DOCKERFILE_RUN} \\
-                [ $(LC_ALL=C rpm --checksig -v *rpm | \\
-                    grep -c -E "^ *V3.*key ID 39db7c82: OK") = {len(_FIPS_15_SP2_BINARIES)} ] \\
-                && rpm -Uvh --oldpackage *.rpm \\
-                && rm -vf *.rpm \\
-                && rpmqpack | grep -E '(openssl|libgcrypt)'  | xargs zypper -n addlock
+            """
             ENV OPENSSL_FIPS=1
             ENV OPENSSL_FORCE_FIPS_MODE=1
             ENV LIBGCRYPT_FORCE_FIPS_MODE=1
+            ENV GNUTLS_FORCE_FIPS_MODE=1
             """
         ),
     )
-    for os_version in (OsVersion.SP3,)
+    # SP5 is known to be having a non-working libgcrypt for FIPS mode
+    for os_version in (OsVersion.SP3, OsVersion.SP4, OsVersion.SP6)
 ]
 
 
@@ -145,7 +207,7 @@ def _get_minimal_kwargs(os_version: OsVersion):
         Package(name, pkg_type=PackageType.BOOTSTRAP)
         for name in os_version.release_package_names
     ]
-    if os_version in (OsVersion.TUMBLEWEED, OsVersion.BASALT):
+    if os_version in (OsVersion.TUMBLEWEED, OsVersion.SLE16_0):
         package_list.append(Package("rpm", pkg_type=PackageType.BOOTSTRAP))
     else:
         # in SLE15, rpm still depends on Perl.
@@ -170,7 +232,6 @@ MINIMAL_CONTAINERS = [
         support_level=SupportLevel.L3,
         supported_until=_SUPPORTED_UNTIL_SLE.get(os_version),
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        package_name="minimal-image",
         logo_url="https://opensource.suse.com/bci/SLE_BCI_logomark_green.svg",
         os_version=os_version,
         build_recipe_type=BuildType.KIWI,
@@ -194,8 +255,8 @@ BUSYBOX_CONTAINERS = [
         from_image=None,
         os_version=os_version,
         support_level=SupportLevel.L3,
+        supported_until=_SUPPORTED_UNTIL_SLE.get(os_version),
         pretty_name=f"{os_version.pretty_os_version_no_dash} BusyBox",
-        package_name="busybox-image",
         logo_url="https://opensource.suse.com/bci/SLE_BCI_logomark_green.svg",
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         build_recipe_type=BuildType.KIWI,
@@ -228,10 +289,11 @@ BUSYBOX_CONTAINERS = [
 KERNEL_MODULE_CONTAINERS = []
 
 for os_version in ALL_OS_VERSIONS - {OsVersion.TUMBLEWEED}:
-    if os_version == OsVersion.BASALT:
-        prefix = "basalt"
-        pretty_prefix = prefix.upper()
+    if os_version == OsVersion.SLE16_0:
+        prefix = "sle16"
+        pretty_prefix = "SLE 16"
     else:
+        assert os_version.is_sle15
         prefix = "sle15"
         pretty_prefix = "SLE 15"
 
@@ -239,23 +301,25 @@ for os_version in ALL_OS_VERSIONS - {OsVersion.TUMBLEWEED}:
         OsContainer(
             name=f"{prefix}-kernel-module-devel",
             pretty_name=f"{pretty_prefix} Kernel module development",
-            package_name=f"{prefix}-kernel-module-devel-image",
             logo_url="https://opensource.suse.com/bci/SLE_BCI_logomark_green.svg",
             os_version=os_version,
+            supported_until=_SUPPORTED_UNTIL_SLE.get(os_version),
             is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-            package_list=[
-                "kernel-devel",
-                "kernel-syms",
-                "gcc",
-                "kmod",
-                "make",
-                "patch",
-                "gawk",
-                "rpm-build",
-                *os_version.release_package_names,
-            ]
-            # tar is not in bci-base in 15.4, but we need it to unpack tarballs
-            + (["tar"] if os_version == OsVersion.SP4 else []),
+            package_list=(
+                [
+                    "kernel-devel",
+                    "kernel-syms",
+                    "gcc",
+                    "kmod",
+                    "make",
+                    "patch",
+                    "gawk",
+                    "rpm-build",
+                    *os_version.release_package_names,
+                ]
+                # tar is not in bci-base in 15.4, but we need it to unpack tarballs
+                + (["tar"] if os_version == OsVersion.SP4 else [])
+            ),
             extra_files={"_constraints": generate_disk_size_constraints(8)},
         )
     )
@@ -266,7 +330,6 @@ OSC_CHECKOUT = (Path(__file__).parent / "gitea-runner" / "osc_checkout").read_by
 GITEA_RUNNER_CONTAINER = OsContainer(
     name="gitea-runner",
     pretty_name="Gitea action runner",
-    package_name="gitea-runner-image",
     os_version=OsVersion.TUMBLEWEED,
     is_latest=True,
     package_list=[

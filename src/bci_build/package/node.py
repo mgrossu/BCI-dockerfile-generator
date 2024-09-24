@@ -7,6 +7,7 @@ from bci_build.package import CAN_BE_LATEST_OS_VERSION
 from bci_build.package import _SUPPORTED_UNTIL_SLE
 from bci_build.package import DevelopmentContainer
 from bci_build.package import OsVersion
+from bci_build.package import Replacement
 from bci_build.package import SupportLevel
 
 _NODE_VERSIONS = Literal[16, 18, 20, 21, 22, 23, 24]
@@ -29,6 +30,7 @@ _NODEJS_SUPPORT_ENDS = {
 
 
 def _get_node_kwargs(ver: _NODE_VERSIONS, os_version: OsVersion):
+    node_version_replacement = "%%nodejs_version%%"
     return {
         "name": "nodejs",
         "os_version": os_version,
@@ -38,20 +40,27 @@ def _get_node_kwargs(ver: _NODE_VERSIONS, os_version: OsVersion):
         "package_name": f"nodejs-{ver}-image",
         "pretty_name": f"Node.js {ver} development",
         "additional_names": ["node"],
-        "version": str(ver),
+        "version": node_version_replacement,
+        "tag_version": str(ver),
+        "additional_versions": [node_version_replacement],
         "package_list": [
             f"nodejs{ver}",
             # devel dependencies:
             f"npm{ver}",
-            "git-core",
-            # used by upstream installation scripts
-            "findutils",
             # dependency of nodejs:
             "update-alternatives",
+        ]
+        + os_version.common_devel_packages,
+        "replacements_via_service": [
+            Replacement(
+                regex_in_build_description=node_version_replacement,
+                package_name=f"nodejs{ver}",
+            ),
         ],
         "env": {
             "NODE_VERSION": ver,
         },
+        "_min_release_counter": 30,
     }
 
 
@@ -61,6 +70,9 @@ NODE_CONTAINERS = [
     ),
     DevelopmentContainer(
         **_get_node_kwargs(20, OsVersion.SP6), support_level=SupportLevel.L3
+    ),
+    DevelopmentContainer(
+        **_get_node_kwargs(20, OsVersion.SP7), support_level=SupportLevel.L3
     ),
     DevelopmentContainer(**_get_node_kwargs(20, OsVersion.TUMBLEWEED)),
     DevelopmentContainer(**_get_node_kwargs(22, OsVersion.TUMBLEWEED)),

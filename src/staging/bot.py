@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 import os
 import random
 import string
@@ -13,10 +14,13 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
 from datetime import timedelta
+from enum import Enum
+from enum import unique
 from functools import reduce
+from io import BytesIO
+from pathlib import Path
 from typing import ClassVar
 from typing import Literal
-from typing import TypedDict
 
 import aiofiles.os
 import aiofiles.tempfile
@@ -27,17 +31,19 @@ from obs_package_update.util import CommandError
 from obs_package_update.util import CommandResult
 from obs_package_update.util import RunCommand
 from obs_package_update.util import retry_async_run_cmd
+from oras.client import OrasClient
 
 from bci_build.logger import LOGGER
 from bci_build.package import ALL_CONTAINER_IMAGE_NAMES
 from bci_build.package import BaseContainerImage
 from bci_build.package import OsVersion
-from dotnet.updater import DOTNET_IMAGES
-from dotnet.updater import DotNetBCI
-from staging.build_result import Arch
+from dotnet.updater import DOTNET_CONTAINERS
 from staging.build_result import PackageBuildResult
 from staging.build_result import PackageStatusCode
 from staging.build_result import RepositoryBuildResult
+from staging.project_setup import ProjectType
+from staging.project_setup import generate_meta
+from staging.project_setup import generate_project_name
 from staging.user import User
 from staging.util import ensure_absent
 from staging.util import get_obs_project_url
@@ -74,8 +80,8 @@ OS_VERSION_NEEDS_BASE_CONTAINER: tuple[OsVersion, ...] = ()
 def _get_base_image_prj_pkg(os_version: OsVersion) -> tuple[str, str]:
     if os_version == OsVersion.TUMBLEWEED:
         return "openSUSE:Factory", "opensuse-tumbleweed-image"
-    if os_version == OsVersion.BASALT:
-        raise ValueError("The Basalt base container is provided by BCI")
+    if os_version == OsVersion.SLE16_0:
+        raise ValueError("The SLFO base container is provided by BCI")
 
     return f"SUSE:SLE-15-SP{os_version}:Update", "sles15-image"
 
@@ -83,7 +89,7 @@ def _get_base_image_prj_pkg(os_version: OsVersion) -> tuple[str, str]:
 def _get_bci_project_name(os_version: OsVersion) -> str:
     prj_suffix = (
         os_version
-        if os_version in (OsVersion.TUMBLEWEED, OsVersion.BASALT)
+        if os_version in (OsVersion.TUMBLEWEED, OsVersion.SLE16_0)
         else "SLE-15-SP" + str(os_version)
     )
     return f"devel:BCI:{prj_suffix}"
@@ -102,9 +108,10 @@ async def _fetch_bci_devel_project_config(
             return await response.text()
 
 
-class _ProjectConfigs(TypedDict):
-    meta: ET.Element
-    prjconf: str
+@unique
+class ProjectConfig(Enum):
+    PRJCONF = "prjconf"
+    META = "prj"
 
 
 @dataclass
@@ -184,6 +191,26 @@ class StagingBot:
         if not self.osc_username:
             raise RuntimeError("osc_username is not set, cannot continue")
 
+    def _read_file_from_branch(self, branch_name: str, file_name: str) -> bytes:
+        tmp = BytesIO()
+        try:
+            git.Repo(Path(__file__).parent.parent.parent).commit(branch_name).tree[
+                file_name
+            ].stream_data(tmp)
+            return tmp.getvalue()
+        except KeyError:
+            raise ValueError(f"File {file_name} not found in branch {branch_name}")
+
+    @property
+    def _devel_project_prjconf(self) -> bytes:
+        """Returns the saved prjconf of the corresponding ``devel:BCI:$subname``
+        project from git
+
+        """
+        return self._read_file_from_branch(
+            f"origin/{self.deployment_branch_name}", "_config"
+        )
+
     @property
     def _bcis(self) -> Generator[BaseContainerImage, None, None]:
         """Generator yielding all
@@ -192,23 +219,14 @@ class StagingBot:
         instance.
 
         """
-        all_bcis = list(ALL_CONTAINER_IMAGE_NAMES.values()) + DOTNET_IMAGES
+        all_bcis = list(ALL_CONTAINER_IMAGE_NAMES.values()) + DOTNET_CONTAINERS
         all_bcis.sort(key=lambda bci: bci.uid)
         return (bci for bci in all_bcis if bci.os_version == self.os_version)
-
-    def _generate_project_name(self, prefix: str) -> str:
-        assert self.osc_username
-        res = f"home:{self.osc_username}:{prefix}:"
-        if self.os_version in (OsVersion.TUMBLEWEED, OsVersion.BASALT):
-            res += str(self.os_version)
-        else:
-            res += f"SLE-15-SP{str(self.os_version)}"
-        return res
 
     @property
     def continuous_rebuild_project_name(self) -> str:
         """The name of the continuous rebuild project on OBS."""
-        return self._generate_project_name("BCI:CR")
+        return generate_project_name(self.os_version, ProjectType.CR, self.osc_username)
 
     @property
     def staging_project_name(self) -> str:
@@ -222,7 +240,9 @@ class StagingBot:
         - ``BRANCH``: :py:attr:`branch_name`
 
         """
-        return self._generate_project_name("BCI:Staging") + ":" + self.branch_name
+        return generate_project_name(
+            self.os_version, ProjectType.STAGING, self.osc_username, self.branch_name
+        )
 
     @property
     def staging_project_url(self) -> str:
@@ -564,96 +584,38 @@ PACKAGES={','.join(self.package_names) if self.package_names else None}
             "osc" if not self._osc_conf_file else f"osc --config={self._osc_conf_file}"
         )
 
-    async def _generate_test_project_meta(self, target_project_name: str) -> ET.Element:
-        bci_devel_meta = ET.fromstring(
-            await _fetch_bci_devel_project_config(self.os_version, "meta")
-        )
-
-        # write the same project meta as devel:BCI, but replace the 'devel:BCI:*'
-        # with the target project name in the main element and in all repository
-        # path entries
-        bci_devel_meta.attrib["name"] = target_project_name
-
-        # we will remove the helmchartsrepo as we do not need it
-        repo_names = []
-        repos_to_remove = []
-
-        # ppc64le & s390x are mostly busted on TW and just cause pointless
-        # build failures, so we don't build them
-        # Also, we don't use the local architecture, so drop that one always
-        arches_to_drop = [str(Arch.LOCAL)]
-        arches_to_drop.extend(
-            [str(Arch.PPC64LE), str(Arch.S390X)]
-            if self.os_version == OsVersion.TUMBLEWEED
-            else []
-        )
-
-        for elem in bci_devel_meta:
-            if elem.tag == "repository":
-                if "name" in elem.attrib:
-                    if (name := elem.attrib["name"]) in ("helmcharts", "standard"):
-                        if name == "helmcharts":
-                            repos_to_remove.append(elem)
-                        continue
-
-                    repo_names.append(name)
-                else:
-                    raise ValueError(
-                        f"Invalid <repository> element, missing 'name' attribute: {ET.tostring(elem).decode()}"
-                    )
-
-                for repo_elem in elem.iter(tag="path"):
-                    if (
-                        "project" in repo_elem.attrib
-                        and "devel:BCI:" in repo_elem.attrib["project"]
-                    ):
-                        repo_elem.attrib["project"] = target_project_name
-
-                arch_entries = list(elem.iter(tag="arch"))
-                for arch_entry in arch_entries:
-                    if arch_entry.text in arches_to_drop:
-                        elem.remove(arch_entry)
-
-                container_repos = ("containerfile", "images")
-                if name in container_repos:
-                    for repo_name in container_repos:
-                        (bci_devel_prj_path := ET.Element("path")).attrib["project"] = (
-                            _get_bci_project_name(self.os_version)
-                        )
-                        bci_devel_prj_path.attrib["repository"] = repo_name
-
-                        elem.insert(0, bci_devel_prj_path)
-
-        self.repositories = repo_names
-        for repo_to_remove in repos_to_remove:
-            bci_devel_meta.remove(repo_to_remove)
-
-        person = ET.Element(
-            "person", {"userid": self.osc_username, "role": "maintainer"}
-        )
-        bci_devel_meta.append(person)
-
-        return bci_devel_meta
-
-    async def _send_prj_meta(
-        self, target_project_name: str, prj_meta: ET.Element
+    async def _send_prj_config(
+        self,
+        target_project_name: str,
+        config: ET.Element | str | bytes,
+        config_type: ProjectConfig = ProjectConfig.META,
     ) -> None:
         """Set the meta of the project on OBS with the name
         ``target_project_name`` to the config ``prj_meta``.
 
         """
+        if isinstance(config, ET.Element) and config_type == ProjectConfig.PRJCONF:
+            raise ValueError("Cannot set the prjconf from a XML Element")
+
         async with aiofiles.tempfile.NamedTemporaryFile(mode="wb") as tmp_meta:
-            await tmp_meta.write(ET.tostring(prj_meta))
+            if isinstance(config, str):
+                data = config.encode()
+            elif isinstance(config, ET.Element):
+                data = ET.tostring(config)
+            else:
+                data = config
+
+            await tmp_meta.write(data)
             await tmp_meta.flush()
 
-            async def _send_prj_meta():
+            async def _send_meta():
                 await self._run_cmd(
-                    f"{self._osc} meta prj --file={tmp_meta.name} {target_project_name}"
+                    f"{self._osc} meta {config_type.value} --file={tmp_meta.name} {target_project_name}"
                 )
 
             # obs sometimes dies setting the project meta with SQL errors 🤯
             # so we just try again…
-            await retry_async_run_cmd(_send_prj_meta)
+            await retry_async_run_cmd(_send_meta)
 
     async def write_cr_project_config(self) -> None:
         """Send the configuration of the continuous rebuild project to OBS.
@@ -662,56 +624,34 @@ PACKAGES={','.join(self.package_names) if self.package_names else None}
         then its configuration (= ``meta`` in OBS jargon) will be updated.
 
         """
-        meta = await self._generate_test_project_meta(
-            self.continuous_rebuild_project_name
+        prj_name, meta = generate_meta(
+            self.os_version, ProjectType.CR, self.osc_username
         )
-        (
-            scmsync := ET.Element("scmsync")
-        ).text = f"https://github.com/SUSE/bci-dockerfile-generator#{self.deployment_branch_name}"
-        meta.append(scmsync)
-        await self._send_prj_meta(self.continuous_rebuild_project_name, meta)
+        await self._send_prj_config(prj_name, meta, ProjectConfig.META)
 
     async def write_staging_project_configs(self) -> None:
         """Submit the ``prjconf`` and ``meta`` to the test project on OBS.
 
-        The ``prjconf`` is taken directly from the development project on OBS
-        (``devel:BCI:*``).
+        The ``meta`` is generated using a template via
+        py.func:`~staging.project_setup.generate_project_name`.
 
-        The ``meta`` has to be modified slightly:
+        The ``prjconf`` is taken from the file:`_config` file in the deployment
+        branch.
 
-        - we remove the ``helmcharts`` repository (we don't create anything for
-          that repo, so not worth creating it)
-        - change the path from ``devel:BCI:*`` to the staging project name
-        - add the bot user as the maintainer (otherwise you can't do anything in
-          the project anymore…)
-
-        Then we send the ``meta`` and then the ``prjconf``.
         """
-        confs: _ProjectConfigs = {}
 
-        async def _fetch_prjconf():
-            confs["prjconf"] = await _fetch_bci_devel_project_config(
-                self.os_version, "prjconf"
-            )
-
-        async def _fetch_prj():
-            confs["meta"] = await self._generate_test_project_meta(
-                self.staging_project_name
-            )
-
-        await asyncio.gather(_fetch_prj(), _fetch_prjconf())
+        prj_name, prj_meta = generate_meta(
+            self.os_version, ProjectType.STAGING, self.osc_username, self.branch_name
+        )
 
         # First set the project meta! This will create the project if it does not
         # exist already, if we do it asynchronously, then the prjconf might be
         # written before the project exists, which fails
-        await self._send_prj_meta(self.staging_project_name, confs["meta"])
+        await self._send_prj_config(prj_name, prj_meta, ProjectConfig.META)
 
-        async with aiofiles.tempfile.NamedTemporaryFile(mode="w") as tmp_prjconf:
-            await tmp_prjconf.write(confs["prjconf"])
-            await tmp_prjconf.flush()
-            await self._run_cmd(
-                f"{self._osc} meta prjconf --file={tmp_prjconf.name} {self.staging_project_name}"
-            )
+        await self._send_prj_config(
+            prj_name, self._devel_project_prjconf, ProjectConfig.PRJCONF
+        )
 
     def _osc_fetch_results_cmd(self, extra_osc_flags: str = "") -> str:
         return (
@@ -995,7 +935,12 @@ PACKAGES={','.join(self.package_names) if self.package_names else None}
 
             await run_in_worktree(
                 f"git commit -m '{commit_msg or 'Test build'}'",
-                env={**_GIT_COMMIT_ENV, **os.environ},
+                env={
+                    **_GIT_COMMIT_ENV,
+                    "GIT_AUTHOR_NAME": _GIT_COMMIT_ENV["GIT_COMMITTER_NAME"],
+                    "GIT_AUTHOR_EMAIL": _GIT_COMMIT_ENV["GIT_COMMITTER_EMAIL"],
+                    **os.environ,
+                },
             )
             return True
 
@@ -1065,9 +1010,6 @@ PACKAGES={','.join(self.package_names) if self.package_names else None}
                     to_remove.append(aiofiles.os.remove(os.path.join(dest, fname)))
 
                 await asyncio.gather(*to_remove)
-
-                if isinstance(bci_pkg, DotNetBCI):
-                    bci_pkg.generate_custom_end()
 
                 return [
                     f"{bci_pkg.package_name}/{fname}"
@@ -1144,6 +1086,52 @@ updates:
         for file_list in files:
             flattened_file_list.extend(file_list)
         return flattened_file_list
+
+    def fetch_container_urls(self) -> list[str]:
+        """Fetch the full urls to all published containers in the staging
+        project including their most relevant tag (either ``latest`` or the
+        first tag). Querying a staging project without published images results
+        in a ``RuntimeError``.
+
+        """
+        client = OrasClient("registry.opensuse.org")
+        all_repos = json.loads(
+            client.do_request(f"{client.prefix}://{client.hostname}/v2/_catalog").text
+        )["repositories"]
+
+        registry_prefix = self.staging_project_name.lower().replace(":", "/")
+
+        ctr_image_paths = [
+            image_path
+            for image_path in all_repos
+            if image_path.startswith(registry_prefix)
+        ]
+
+        if not ctr_image_paths:
+            raise RuntimeError(f"No images published with the prefix {registry_prefix}")
+
+        full_urls = []
+        for ctr_path in ctr_image_paths:
+            tags = client.get_tags(ctr_path)
+            if "latest" in tags:
+                tag = "latest"
+            else:
+                tag = tags[0]
+            full_urls.append(f"{client.hostname}/{ctr_path}:{tag}")
+
+        return full_urls
+
+    def container_urls_html(self) -> str:
+        """Pretty print the output of :py:func:`StagingBot.fetch_container_urls`
+        wrapped in a ``<details></details>`` HTML element for GitHub.
+
+        """
+        urls = self.fetch_container_urls()
+        return (
+            "<details><summary>The following images can be pulled from the staging project:</summary>\n\n"
+            + ("\n".join(f"- `{url}`" for url in urls))
+            + "\n</details>"
+        )
 
     async def fetch_build_results(self) -> list[RepositoryBuildResult]:
         """Retrieves the current build results of the staging project."""
@@ -1395,7 +1383,7 @@ updates:
             for commit in commits:
                 package_names.extend(self._get_changed_packages_by_commit(commit))
 
-            package_names = list(set(package_names))
+            package_names = sorted(set(package_names))
 
         if not package_names:
             raise ValueError(
@@ -1495,6 +1483,26 @@ updates:
             if not changelog_updated
         ]
 
+    async def configure_devel_bci_project(self) -> None:
+        """Adjust to project meta of the devel project on OBS to match the
+        template generated via
+        :py:func:`staging.project_setup.generate_meta`. Additionally set the
+        project meta from the file :file:`_config` in the deployment branch and
+        set the `OSRT:Config` attribute for pkglistgen to function as expected.
+
+        """
+        prj_name, meta = generate_meta(
+            self.os_version, ProjectType.DEVEL, self.osc_username
+        )
+        await self._send_prj_config(prj_name, meta, ProjectConfig.META)
+
+        await self._send_prj_config(
+            prj_name, self._devel_project_prjconf, ProjectConfig.PRJCONF
+        )
+
+        await self._run_cmd(f"""{self._osc} meta attribute {prj_name} -a OSRT:Config --set 'main-repo = standard
+pkglistgen-archs = ppc64le s390x aarch64 x86_64'""")
+
     async def configure_devel_bci_package(self, package_name: str) -> None:
         bci = [b for b in self._bcis if b.package_name == package_name]
 
@@ -1560,7 +1568,9 @@ def main() -> None:
         "add_changelog_entry",
         "changelog_check",
         "setup_obs_package",
+        "setup_obs_project",
         "find_missing_packages",
+        "get_container_urls",
     ]
 
     parser = argparse.ArgumentParser()
@@ -1731,12 +1741,21 @@ comma-separated list. The package list is taken from the environment variable
         type=str,
         help="Name of the package to configure on OBS",
         choices=list({bci.package_name for bci in ALL_CONTAINER_IMAGE_NAMES.values()})
-        + [dotnet_img.package_name for dotnet_img in DOTNET_IMAGES],
+        + [dotnet_img.package_name for dotnet_img in DOTNET_CONTAINERS],
+    )
+
+    subparsers.add_parser(
+        "setup_obs_project", help="Configure the devel project on OBS"
     )
 
     subparsers.add_parser(
         "find_missing_packages",
         help="Find all packages that are in the deployment branch and are missing from `devel:BCI:*` on OBS",
+    )
+
+    subparsers.add_parser(
+        "get_container_urls",
+        help="Get the full urls to the containers built in the staging project",
     )
 
     loop = asyncio.get_event_loop()
@@ -1881,12 +1900,22 @@ comma-separated list. The package list is taken from the environment variable
 
             coro = _setup_pkg_meta()
 
+        elif action == "setup_obs_project":
+            coro = bot.configure_devel_bci_project()
+
         elif action == "find_missing_packages":
 
             async def _pkgs_as_str() -> str:
                 return ", ".join(await bot.find_missing_packages_on_obs())
 
             coro = _pkgs_as_str()
+
+        elif action == "get_container_urls":
+
+            async def _get_container_urls() -> str:
+                return bot.container_urls_html()
+
+            coro = _get_container_urls()
 
         else:
             assert False, f"invalid action: {action}"

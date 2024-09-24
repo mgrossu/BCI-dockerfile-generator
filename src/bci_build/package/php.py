@@ -134,7 +134,9 @@ EXPOSE 9000
     return DevelopmentContainer(
         name=str(php_variant).lower(),
         no_recommends=False,
-        version=php_version,
+        version="%%php_version%%",
+        tag_version=php_version,
+        additional_versions=["%%php_version%%"],
         pretty_name=f"{str(php_variant)} {php_version}",
         package_name=f"{str(php_variant).lower()}{php_version}-image",
         os_version=os_version,
@@ -186,13 +188,14 @@ zypper -n in ${{extensions[*]}}
 """,
         },
         custom_end=custom_end,
+        _min_release_counter=30,
     )
 
 
 PHP_CONTAINERS = [
     _create_php_bci(os_version, variant, 8)
     for os_version, variant in product(
-        (OsVersion.SP6, OsVersion.TUMBLEWEED),
+        (OsVersion.SP6, OsVersion.SP7, OsVersion.TUMBLEWEED),
         (PhpVariant.cli, PhpVariant.apache, PhpVariant.fpm),
     )
 ]

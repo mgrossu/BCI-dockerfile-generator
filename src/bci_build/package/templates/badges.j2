@@ -1,14 +1,18 @@
 {% if image.eula == 'sle-bci' -%}
 ![Redistributable](https://img.shields.io/badge/Redistributable-Yes-green)
 {%- endif %}
-{%- if not image.is_opensuse and image.support_level | string != 'l3' -%}
+{%- if not image.os_version.is_tumbleweed and image.support_level | string != 'l3' -%}
 ![Support Level](https://img.shields.io/badge/Support_Level-{{ image.support_level }}-blue)
 {%- endif %}
-{%- if not image.is_opensuse and image.image_type | string == "ltss" -%}
+{%- if not image.os_version.is_tumbleweed and image.image_type | string == "ltss" -%}
 ![Access Protected](https://img.shields.io/badge/Requires_login_for_access-orange)
 ![Long Term Service Pack Support](https://img.shields.io/badge/LTSS-Yes-orange)
 {%- endif %}
-{%- if not image.is_opensuse %}
+{%- if not image.os_version.is_tumbleweed %}
+{%- if image.os_version.is_sle15 and image.os_version.os_version not in ("15.3", "15.4", "15.5") -%}
+[![SLSA](https://img.shields.io/badge/SLSA_(v1.0)-Build_L3-Green)](https://documentation.suse.com/sbp/server-linux/html/SBP-SLSA4/)
+{%- else %}
 [![SLSA](https://img.shields.io/badge/SLSA_(v0.1)-Level_4-Green)](https://documentation.suse.com/sbp/server-linux/html/SBP-SLSA4/)
+{%- endif %}
 [![Provenance: Available](https://img.shields.io/badge/Provenance-Available-Green)](https://documentation.suse.com/container/all/html/Container-guide/index.html#container-verify)
 {%- endif %}

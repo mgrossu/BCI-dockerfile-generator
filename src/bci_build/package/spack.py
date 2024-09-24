@@ -7,31 +7,24 @@ from bci_build.package import Arch
 from bci_build.package import DevelopmentContainer
 from bci_build.package import OsVersion
 from bci_build.package import ParseVersion
-from bci_build.package import Replacement
 from bci_build.package import SupportLevel
 from bci_build.package import generate_disk_size_constraints
 from bci_build.package.helpers import generate_package_version_check
+from bci_build.package.versions import format_version
 from bci_build.package.versions import get_pkg_version
 
 SPACK_CONTAINERS = [
     DevelopmentContainer(
         name="spack",
-        package_name="spack-image",
         pretty_name="Spack development",
-        custom_description="Spack is a flexible package manager for supercomputers, {based_on_container}.",
+        custom_description="{pretty_name} container for building containerized HPC solution stacks, {based_on_container}.",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         logo_url="https://spack.io/assets/images/spack-logo-white.svg",
         version=(spack_pkg_version := get_pkg_version("spack", os_version)),
+        tag_version=format_version(spack_pkg_version, ParseVersion.MINOR),
+        additional_versions=[spack_pkg_version],
         version_in_uid=False,
-        additional_versions=["%%spack_minor%%"],
-        replacements_via_service=[
-            Replacement(
-                regex_in_build_description="%%spack_minor%%",
-                package_name="spack",
-                parse_version=ParseVersion.MINOR,
-            ),
-        ],
         package_list=[
             "spack",
             "bison",
@@ -62,6 +55,9 @@ SPACK_CONTAINERS = [
         },
         # HPC module only exists for those two arches (bsc#1224130)
         exclusive_arch=[Arch.AARCH64, Arch.X86_64],
+        extra_labels={
+            "usage": "This container is enabled and supported only on a SLE15+ host."
+        },
         support_level=SupportLevel.L3,
         supported_until=_SUPPORTED_UNTIL_SLE[OsVersion.SP6],
         custom_end=rf"""
@@ -77,11 +73,11 @@ SPACK_CONTAINERS = [
        /root/.spack/modules.yaml \
     && rm -rf /root/*.* /run/nologin
 
-{generate_package_version_check('spack', spack_pkg_version, 'patch')}
+{generate_package_version_check('spack', spack_pkg_version, ParseVersion.PATCH)}
 
 WORKDIR /root
 SHELL ["docker-shell"]
 """,
     )
-    for os_version in [OsVersion.SP6, OsVersion.TUMBLEWEED]
+    for os_version in [OsVersion.SP6, OsVersion.SP7, OsVersion.TUMBLEWEED]
 ]

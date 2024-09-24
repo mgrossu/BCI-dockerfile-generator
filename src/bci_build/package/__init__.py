@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import abc
@@ -133,10 +132,10 @@ class OsVersion(enum.Enum):
     SP4 = 4
     #: SLE 15 Service Pack 3
     SP3 = 3
+    #: SUSE Linux Framework One
+    SLE16_0 = "16.0"
     #: openSUSE Tumbleweed
     TUMBLEWEED = "Tumbleweed"
-    #: Adaptable Linux Platform, Basalt project
-    BASALT = "Basalt"
 
     @staticmethod
     def parse(val: str) -> OsVersion:
@@ -150,7 +149,7 @@ class OsVersion(enum.Enum):
 
     @property
     def pretty_print(self) -> str:
-        if self.value in (OsVersion.TUMBLEWEED.value, OsVersion.BASALT.value):
+        if self.value in (OsVersion.TUMBLEWEED.value, OsVersion.SLE16_0.value):
             return self.value
         return f"SP{self.value}"
 
@@ -160,24 +159,52 @@ class OsVersion(enum.Enum):
             # TW has no version by itself and the "openSUSE Tumbleweed" is
             # already part of the base identifier
             return ""
-        if self.value == OsVersion.BASALT.value:
-            return "Adaptable Linux Platform"
+        if self.is_slfo:
+            return "16"
 
         return f"15 SP{self.value}"
 
     @property
+    def distribution_base_name(self) -> str:
+        if self.is_tumbleweed:
+            return "openSUSE Tumbleweed"
+        elif self.is_ltss:
+            return "SLE LTSS"
+        elif self.is_sle15 or self.is_slfo:
+            return "SLE"
+
+        raise NotImplementedError(f"Unknown os_version: {self.value}")
+
+    @property
+    def full_os_name(self) -> str:
+        if self.is_tumbleweed:
+            return self.distribution_base_name
+
+        return f"{self.distribution_base_name} {self.pretty_os_version_no_dash}"
+
+    @property
     def deployment_branch_name(self) -> str:
-        return (
-            str(self.value)
-            if self.value in (OsVersion.TUMBLEWEED.value, OsVersion.BASALT.value)
-            else f"sle15-sp{self.value}"
-        )
+        if self.is_tumbleweed or self.is_slfo:
+            return str(self.value)
+        if self.is_sle15:
+            return f"sle15-sp{self.value}"
+        raise NotImplementedError("unhandled version {self.value}")
 
     @property
     def lifecycle_data_pkg(self) -> list[str]:
-        if self.value not in (OsVersion.BASALT.value, OsVersion.TUMBLEWEED.value):
+        if self.value not in (OsVersion.SLE16_0.value, OsVersion.TUMBLEWEED.value):
             return ["lifecycle-data-sle-module-development-tools"]
         return []
+
+    @property
+    def common_devel_packages(self) -> list[str]:
+        """Returns a list of common development packages that are needed for
+        all development containers"""
+        r = set(("findutils", "gawk", "git-core", "curl", "procps"))
+        if self.is_tumbleweed or self.is_slfo:
+            r.add("util-linux")
+
+        return sorted(list(r))
 
     @property
     def is_sle15(self) -> bool:
@@ -190,8 +217,16 @@ class OsVersion(enum.Enum):
         )
 
     @property
+    def is_slfo(self) -> bool:
+        return self.value in (OsVersion.SLE16_0.value,)
+
+    @property
     def is_tumbleweed(self) -> bool:
         return self.value == OsVersion.TUMBLEWEED.value
+
+    @property
+    def is_ltss(self) -> bool:
+        return self in ALL_OS_LTSS_VERSIONS
 
     @property
     def os_version(self) -> str:
@@ -201,33 +236,32 @@ class OsVersion(enum.Enum):
         """
         if self.is_sle15:
             return f"15.{str(self.value)}"
-        # FIXME
-        # if self.is_slcc:
-        #     return "16.0"
-
+        if self.value == OsVersion.SLE16_0.value:
+            return "16.0"
         # Tumbleweed rolls too fast, just use latest
         return "latest"
 
     @property
     def has_container_suseconnect(self) -> bool:
-        return self.is_sle15  # or self.value == OsVersion.SLCC_SLES_16_CONTAINERS
+        return self.is_sle15 or self.is_slfo
 
     @property
     def eula_package_names(self) -> tuple[str, ...]:
         if self.is_sle15:
             return ("skelcd-EULA-bci",)
-        # if self.is_slcc:
-        #     return (f"skelcd-EULA-{str(self.value).lower()}",)
+        # TODO: switch to skelcd-EULA-bci when SLES 16 is released
+        if self.value == OsVersion.SLE16_0.value:
+            return ("skelcd-EULA-SLES",)
         return ()
 
     @property
     def release_package_names(self) -> tuple[str, ...]:
         if self.value == OsVersion.TUMBLEWEED.value:
             return ("openSUSE-release", "openSUSE-release-appliance-docker")
-        if self.value == OsVersion.BASALT.value:
-            return ("ALP-dummy-release",)
-        # if self.is_slcc:
-        #     return (f"{str(self.value).lower()}-release",)
+        if self.value == OsVersion.SLE16_0.value:
+            return ("SLES-release",)
+        if self.is_ltss:
+            return ("sles-ltss-release",)
 
         assert self.is_sle15
         return ("sles-release",)
@@ -246,6 +280,7 @@ RELEASED_OS_VERSIONS: list[OsVersion] = [
 # For which versions to create Application and Language Containers?
 ALL_NONBASE_OS_VERSIONS: list[OsVersion] = [
     OsVersion.SP6,
+    OsVersion.SP7,
     OsVersion.TUMBLEWEED,
 ]
 
@@ -253,8 +288,9 @@ ALL_NONBASE_OS_VERSIONS: list[OsVersion] = [
 ALL_BASE_OS_VERSIONS: list[OsVersion] = [
     OsVersion.SP5,
     OsVersion.SP6,
+    OsVersion.SP7,
     OsVersion.TUMBLEWEED,
-    OsVersion.BASALT,
+    OsVersion.SLE16_0,
 ]
 
 # List of SPs that are already under LTSS
@@ -268,7 +304,6 @@ ALL_OS_VERSIONS: set[OsVersion] = {
 CAN_BE_LATEST_OS_VERSION: list[OsVersion] = [
     OsVersion.SP6,
     OsVersion.TUMBLEWEED,
-    OsVersion.BASALT,
 ]
 
 
@@ -343,116 +378,12 @@ class Replacement:
 def _build_tag_prefix(os_version: OsVersion) -> str:
     if os_version == OsVersion.TUMBLEWEED:
         return "opensuse/bci"
-    if os_version == OsVersion.BASALT:
-        return "alp/bci"
     if os_version == OsVersion.SP3:
         return "suse/ltss/sle15.3"
     if os_version == OsVersion.SP4:
         return "suse/ltss/sle15.4"
 
     return "bci"
-
-
-@dataclass(frozen=True)
-class ImageProperties:
-    """Class storing the properties of the Base Container that differ
-    depending on the vendor.
-
-    """
-
-    #: maintainer of the image
-    maintainer: str
-
-    #: full vendor string as it will be included in the
-    #: ``org.opencontainers.image.vendor`` label
-    vendor: str
-
-    #: The name of the underlying distribution. It will be inserted into the
-    #: image's title as ``$distribution_base_name BCI $pretty_name Container
-    #: Image``.
-    distribution_base_name: str
-
-    #: The url to the registry of this vendor
-    registry: str
-
-    #: Url to the vendor's home page
-    url: str
-
-    #: The EULA identifier to set
-    eula: str
-
-    #: Url to learn about the support lifecycle of the image
-    lifecycle_url: str
-
-    #: The prefix of the label names ``$label_prefix.bci.$label = foobar``
-    label_prefix: str
-
-    #: The prefix of the build tag for DevelopmentContainer and OsContainer Images.
-    #: The build tag is constructed as `$build_tag_prefix/$name`
-    build_tag_prefix: str
-
-    #: Same as :py:attr:`build_tag_prefix` but for ApplicationStackContainer Images.
-    application_container_build_tag_prefix: str
-
-    #:
-    based_on_container_description: str | None = None
-
-
-#: Image properties for openSUSE Tumbleweed
-_OPENSUSE_IMAGE_PROPS = ImageProperties(
-    maintainer="openSUSE (https://www.opensuse.org/)",
-    vendor="openSUSE Project",
-    registry="registry.opensuse.org",
-    url="https://www.opensuse.org",
-    eula="sle-bci",
-    lifecycle_url="https://en.opensuse.org/Lifetime",
-    label_prefix="org.opensuse",
-    distribution_base_name="openSUSE Tumbleweed",
-    build_tag_prefix=_build_tag_prefix(OsVersion.TUMBLEWEED),
-    application_container_build_tag_prefix="opensuse",
-)
-
-#: Image properties for SUSE Linux Enterprise
-_SLE_IMAGE_PROPS = ImageProperties(
-    maintainer="SUSE LLC (https://www.suse.com/)",
-    vendor="SUSE LLC",
-    registry="registry.suse.com",
-    url="https://www.suse.com/products/base-container-images/",
-    eula="sle-bci",
-    lifecycle_url="https://www.suse.com/lifecycle#suse-linux-enterprise-server-15",
-    label_prefix="com.suse",
-    distribution_base_name="SLE",
-    build_tag_prefix=_build_tag_prefix(OsVersion.SP5),
-    application_container_build_tag_prefix="suse",
-)
-
-#: Image properties for SUSE Linux Enterprise 15 SP3 LTSS images
-_SLE_15_SP3_LTSS_IMAGE_PROPS = ImageProperties(
-    maintainer="SUSE LLC (https://www.suse.com/)",
-    vendor="SUSE LLC",
-    registry="registry.suse.com",
-    url="https://www.suse.com/products/server/",
-    eula="sle-eula",
-    lifecycle_url="https://www.suse.com/lifecycle#suse-linux-enterprise-server-15",
-    label_prefix="com.suse",
-    distribution_base_name="SLE LTSS",
-    build_tag_prefix=_build_tag_prefix(OsVersion.SP3),
-    application_container_build_tag_prefix="suse",
-)
-
-_BASALT_IMAGE_PROPS = ImageProperties(
-    maintainer="SUSE LLC (https://www.suse.com/)",
-    vendor="SUSE LLC",
-    registry="registry.suse.com",
-    url="https://susealp.io/",
-    eula="sle-bci",
-    lifecycle_url="https://www.suse.com/lifecycle",
-    label_prefix="com.suse.basalt",
-    distribution_base_name="Basalt Project",
-    build_tag_prefix=_build_tag_prefix(OsVersion.BASALT),
-    application_container_build_tag_prefix="suse",
-    based_on_container_description="based on the SUSE Adaptable Linux Platform (ALP)",
-)
 
 
 @dataclass
@@ -463,26 +394,31 @@ class BaseContainerImage(abc.ABC):
     #: defines under which name this image is published.
     name: str
 
+    #: The SLE service pack to which this package belongs
+    os_version: OsVersion
+
     #: Human readable name that will be inserted into the image title and description
     pretty_name: str
 
-    #: The name of the package on OBS or IBS in ``devel:BCI:SLE-15-SP$ver`` (on
-    #: OBS) or ``SUSE:SLE-15-SP$ver:Update:BCI`` (on IBS)
-    package_name: str
-
-    #: The SLE service pack to which this package belongs
-    os_version: OsVersion
+    #: Optional a package_name, used for creating the package name on OBS or IBS in
+    # ``devel:BCI:SLE-15-SP$ver`` (on  OBS) or ``SUSE:SLE-15-SP$ver:Update:BCI`` (on IBS)
+    package_name: str | None = None
 
     #: Epoch to use for handling os_version downgrades
     os_epoch: int | None = None
 
-    #: The container from which this one is derived. defaults to
-    #: ``suse/sle15:15.$SP`` (for SLE) or ``opensuse/tumbleweed:latest`` (for
-    #: Tumbleweed) when an empty string is used.
+    #: The container from which the build stage is running. On SLE15, this defaults to
+    #: ``suse/sle15:15.$SP`` for Application Containers and ``bci/bci-base:15.$SP``
+    #: for all other images. On openSUSE, ``opensuse/tumbleweed:latest`` is used
+    #: when an empty string is used.
     #:
     #: When from image is ``None``, then this image will not be based on
     #: **anything**, i.e. the ``FROM`` line is missing in the ``Dockerfile``.
     from_image: str | None = ""
+
+    #: The container that is used to install this image into. If this is not set, then
+    #: only a single stage build is produced, otherwise a multistage build
+    from_target_image: str | None = None
 
     #: Architectures of this image.
     #:
@@ -528,8 +464,8 @@ class BaseContainerImage(abc.ABC):
     #: See also :py:class:`~Replacement`
     replacements_via_service: list[Replacement] = field(default_factory=list)
 
-    #: Additional labels that should be added to the image. These are added into
-    #: the ``PREFIXEDLABEL`` section.
+    #: Additional labels that should be added to the image. These are added as labels
+    #  within the "labelprefix" section.
     extra_labels: dict[str, str] = field(default_factory=dict)
 
     #: Packages to be installed inside the container image
@@ -560,7 +496,7 @@ class BaseContainerImage(abc.ABC):
     #: for bash and not for a different shell.
     config_sh_interpreter: str = "/bin/bash"
 
-    #: The maintainer of this image, defaults to SUSE/openSUSE
+    #: The oci image author annoation for this image, defaults to SUSE/openSUSE
     maintainer: str | None = None
 
     #: Additional files that belong into this container-package.
@@ -587,6 +523,10 @@ class BaseContainerImage(abc.ABC):
     #: If not set, then the build type will default to docker from SP4 onwards.
     build_recipe_type: BuildType | None = None
 
+    #: Define packages that should be ignored by kiwi in the creation of the
+    #: final container image even if dependencies would otherwise pull them in.
+    kiwi_ignore_packages: list[str] | None = None
+
     #: A license string to be placed in a comment at the top of the Dockerfile
     #: or kiwi build description file.
     license: str = "MIT"
@@ -606,11 +546,17 @@ class BaseContainerImage(abc.ABC):
     #: present
     logo_url: str = ""
 
-    _image_properties: ImageProperties = field(default=_SLE_IMAGE_PROPS)
+    #: Optional build_release setting that will be inserted as the
+    #: ``#!BuildRelease`` magic comment for the build service to ensure that
+    #: the release suffix of a container tag is sequentially increasing (for
+    #: webui sorting)
+    _min_release_counter: int | None = None
 
     def __post_init__(self) -> None:
         self.pretty_name = self.pretty_name.strip()
 
+        if not self.package_name:
+            self.package_name = f"{self.name}-image"
         if not self.package_list:
             raise ValueError(f"No packages were added to {self.pretty_name}.")
         if self.exclusive_arch and Arch.LOCAL in self.exclusive_arch:
@@ -625,17 +571,12 @@ class BaseContainerImage(abc.ABC):
                 BuildType.KIWI if self.os_version == OsVersion.SP3 else BuildType.DOCKER
             )
 
-        if self.is_opensuse:
-            self._image_properties = _OPENSUSE_IMAGE_PROPS
-        elif self.os_version == OsVersion.BASALT:
-            self._image_properties = _BASALT_IMAGE_PROPS
-        elif self.os_version == OsVersion.SP3:
-            self._image_properties = _SLE_15_SP3_LTSS_IMAGE_PROPS
-        else:
-            self._image_properties = _SLE_IMAGE_PROPS
-
         if not self.maintainer:
-            self.maintainer = self._image_properties.maintainer
+            self.maintainer = (
+                "openSUSE (https://www.opensuse.org/)"
+                if self.os_version.is_tumbleweed
+                else "SUSE LLC (https://www.suse.com/)"
+            )
 
         # limit to tech preview for beta releases
         if (
@@ -644,32 +585,32 @@ class BaseContainerImage(abc.ABC):
         ):
             self.support_level = SupportLevel.TECHPREVIEW
 
-    @property
-    def is_opensuse(self) -> bool:
-        return self.os_version == OsVersion.TUMBLEWEED
-
-    @property
     @abc.abstractmethod
-    def uid(self) -> str:
-        """unique identifier of this image, either its name or ``$name-$version``."""
+    def prepare_template(self) -> None:
+        """Hook to do delayed expensive work prior template rendering"""
+
         pass
 
     @property
     @abc.abstractmethod
-    def version_label(self) -> str:
+    def uid(self) -> str:
+        """unique identifier of this image, either its name or ``$name-$tag_version``."""
+        pass
+
+    @property
+    @abc.abstractmethod
+    def oci_version(self) -> str:
         """The "main" version label of this image.
 
         It is added as the ``org.opencontainers.image.version`` label to the
-        container image and also added to the
-        :py:attr:`~BaseContainerImage.build_tags`.
-
+        container image.
         """
         pass
 
     @property
     def build_name(self) -> str | None:
         if self.build_tags:
-            build_name = self.build_tags[0]
+            build_name: str = self.build_tags[0]
             if self.is_singleton_image:
                 build_name = build_name.partition(":")[0]
             return build_name.replace("/", ":").replace(":", "-")
@@ -678,7 +619,7 @@ class BaseContainerImage(abc.ABC):
 
     @property
     def build_version(self) -> str | None:
-        if self.os_version not in (OsVersion.TUMBLEWEED, OsVersion.BASALT):
+        if self.os_version not in (OsVersion.TUMBLEWEED, OsVersion.SLE16_0):
             epoch = ""
             if self.os_epoch:
                 epoch = f"{self.os_epoch}."
@@ -686,12 +627,30 @@ class BaseContainerImage(abc.ABC):
         return None
 
     @property
+    def build_release(self) -> str | None:
+        if self.os_version not in (OsVersion.SP6,):
+            return None
+
+        return (
+            str(self._min_release_counter)
+            if self._min_release_counter is not None
+            else None
+        )
+
+    @property
     def eula(self) -> str:
-        return self._image_properties.eula
+        """EULA covering this image. can be ``sle-eula`` or ``sle-bci``."""
+        if self.os_version.is_ltss:
+            return "sle-eula"
+        return "sle-bci"
 
     @property
     def lifecycle_url(self) -> str:
-        return self._image_properties.lifecycle_url
+        if self.os_version.is_tumbleweed:
+            return "https://en.opensuse.org/Lifetime#openSUSE_BCI"
+        if self.os_version.is_sle15:
+            return "https://www.suse.com/lifecycle#suse-linux-enterprise-server-15"
+        return "https://www.suse.com/lifecycle"
 
     @property
     def release_stage(self) -> ReleaseStage:
@@ -714,7 +673,12 @@ class BaseContainerImage(abc.ABC):
         ``org.opencontainers.image.url`` label
 
         """
-        return self._image_properties.url
+        if self.os_version.is_tumbleweed:
+            return "https://www.opensuse.org"
+        if self.os_version.is_ltss:
+            return "https://www.suse.com/products/long-term-service-pack-support/"
+
+        return "https://www.suse.com/products/base-container-images/"
 
     @property
     def vendor(self) -> str:
@@ -722,12 +686,23 @@ class BaseContainerImage(abc.ABC):
         label
 
         """
-        return self._image_properties.vendor
+        if self.os_version.is_tumbleweed:
+            return "openSUSE Project"
+        return "SUSE LLC"
+
+    @property
+    def base_image_registry(self) -> str:
+        """The registry where the base image is available on."""
+        if self.os_version.is_tumbleweed:
+            return "registry.opensuse.org"
+        return "registry.suse.com"
 
     @property
     def registry(self) -> str:
         """The registry where the image is available on."""
-        return self._image_properties.registry
+        if self.os_version.is_tumbleweed:
+            return "registry.opensuse.org"
+        return "registry.suse.com"
 
     @property
     def dockerfile_custom_end(self) -> str:
@@ -747,7 +722,7 @@ class BaseContainerImage(abc.ABC):
 
     @property
     def _registry_prefix(self) -> str:
-        return self._image_properties.build_tag_prefix
+        return _build_tag_prefix(self.os_version)
 
     @staticmethod
     def _cmd_entrypoint_docker(
@@ -844,8 +819,8 @@ exit 0
 
         if self.os_version == OsVersion.TUMBLEWEED:
             return "opensuse/tumbleweed:latest"
-        if self.os_version == OsVersion.BASALT:
-            return f"{_build_tag_prefix(self.os_version)}/bci-base:latest"
+        if self.os_version == OsVersion.SLE16_0:
+            return f"{_build_tag_prefix(self.os_version)}/bci-base:{self.os_version}"
         if self.os_version in ALL_OS_LTSS_VERSIONS:
             return f"{_build_tag_prefix(self.os_version)}/sle15:15.{self.os_version}"
         if self.image_type == ImageType.APPLICATION:
@@ -857,6 +832,16 @@ exit 0
     def dockerfile_from_line(self) -> str:
         if self._from_image is None:
             return ""
+
+        if self.from_target_image:
+            # build against the released container on SLE for proper base.digest/name generation
+            target: str = (
+                self.from_target_image
+                if self.os_version.is_tumbleweed
+                else f"{self.base_image_registry}/{self.from_target_image}"
+            )
+            return f"FROM {target} AS target\nFROM {self._from_image} AS builder"
+
         return f"FROM {self._from_image}"
 
     @property
@@ -974,6 +959,9 @@ exit 0
 
             return pkg_filter_func
 
+        def pkg_listing_func(pkg: Package) -> str:
+            return f'<package name="{pkg}"/>'
+
         PKG_TYPES = (
             PackageType.DELETE,
             PackageType.BOOTSTRAP,
@@ -994,8 +982,7 @@ exit 0
                 res += (
                     f"""  <packages type="{pkg_type}">
     """
-                    + """
-    """.join(f'<package name="{pkg}"/>' for pkg in pkg_list)
+                    + "\n    ".join(pkg_listing_func(pkg) for pkg in pkg_list)
                     + """
   </packages>
 """
@@ -1046,10 +1033,19 @@ exit 0
 
     @property
     @abc.abstractmethod
+    def image_ref_name(self) -> str:
+        """The immutable reference for this target under which this image can be pulled. It is used
+        to set the ``org.opencontainers.image.ref.name`` OCI annotation and defaults to
+        ``{self.build_tags[0]}``.
+        """
+        pass
+
+    @property
+    @abc.abstractmethod
     def reference(self) -> str:
         """The primary URL via which this image can be pulled. It is used to set the
         ``org.opensuse.reference`` label and defaults to
-        ``{self.registry}/{self.build_tags[0]}``.
+        ``{self.registry}/{self.image_ref_name}``.
 
         """
         pass
@@ -1077,6 +1073,7 @@ exit 0
         - ``{pretty_name}``: the value of the pretty_name property
         - ``{based_on_container}``: the standard "based on the $distro Base Container Image" suffix that descriptions have
         - ``{podman_only}``: "This container is only supported with podman."
+        - ``{privileged_only}``: "This container is only supported in privileged mode."
 
         Otherwise it reuses
         :py:attr:`BaseContainerImage.pretty_name` to generate a description.
@@ -1086,10 +1083,10 @@ exit 0
         description_formatters = {
             "pretty_name": self.pretty_name,
             "based_on_container": (
-                self._image_properties.based_on_container_description
-                or f"based on the {self._image_properties.distribution_base_name} Base Container Image"
+                f"based on the {self.os_version.distribution_base_name} Base Container Image"
             ),
             "podman_only": "This container is only supported with podman.",
+            "privileged_only": "This container is only supported in privileged mode.",
         }
         description = "{pretty_name} container {based_on_container}."
         if self.custom_description:
@@ -1105,10 +1102,10 @@ exit 0
         It is generated from :py:attr:`BaseContainerImage.pretty_name` as
         follows: ``"{distribution_base_name} BCI {self.pretty_name}"``, where
         ``distribution_base_name`` is taken from
-        :py:attr:`~ImageProperties.distribution_base_name`.
+        :py:attr:`~OsVersion.distribution_base_name`.
 
         """
-        return f"{self._image_properties.distribution_base_name} BCI {self.pretty_name}"
+        return f"{self.os_version.distribution_base_name} BCI {self.pretty_name}"
 
     @property
     def readme_path(self) -> str:
@@ -1120,7 +1117,7 @@ exit 0
         # with a url like:
         # https://build.opensuse.org/package/show/openSUSE:Factory/ruby-3.2-image?rev=2bf407f529a768e95f024bce5a916c69
         # to point to the README, we'd have to inject something *before* the query
-        if self.is_opensuse:
+        if self.os_version.is_tumbleweed:
             return f"https://raw.githubusercontent.com/SUSE/BCI-dockerfile-generator/{self.os_version.deployment_branch_name}/{self.readme_path}"
 
         return "%SOURCEURL%/README.md"
@@ -1193,8 +1190,11 @@ exit 0
         :py:attr:`~BaseContainerImage.custom_labelprefix_end`.
 
         """
+        labelprefix = "com.suse"
+        if self.os_version.is_tumbleweed:
+            labelprefix = "org.opensuse"
         return (
-            self._image_properties.label_prefix
+            labelprefix
             + "."
             + (
                 {
@@ -1209,7 +1209,7 @@ exit 0
 
     @property
     def kiwi_version(self) -> str:
-        if self.os_version in (OsVersion.TUMBLEWEED, OsVersion.BASALT):
+        if self.os_version in (OsVersion.TUMBLEWEED, OsVersion.SLE16_0):
             return str(datetime.datetime.now().year)
         return f"15.{int(self.os_version.value)}.0"
 
@@ -1224,10 +1224,12 @@ exit 0
         the image itself.
 
         """
-        extra_tags = []
-        for buildtag in self.build_tags[1:]:
+        extra_tags: list[str] = []
+        all_tags = self.build_tags
+        first_path = all_tags[0].partition(":")[0]
+        for buildtag in all_tags[1:]:
             path, tag = buildtag.split(":")
-            if path.endswith(self.name):
+            if path.endswith(first_path):
                 extra_tags.append(tag)
 
         return ",".join(extra_tags) if extra_tags else None
@@ -1239,6 +1241,8 @@ exit 0
         """
         files = ["_service"]
         tasks = []
+
+        self.prepare_template()
 
         async def write_file_to_dest(fname: str, contents: str | bytes) -> None:
             await write_to_file(os.path.join(dest, fname), contents)
@@ -1337,8 +1341,13 @@ exit 0
 
 @dataclass
 class DevelopmentContainer(BaseContainerImage):
-    #: the primary version of the language or application inside this container
+    #: the main version of the language or application inside this container
+    #: used for `org.opencontainers.image.version`
     version: str | int = ""
+
+    #: the version-$variant to use in the first build_tag. defaults to version
+    #: if not set.
+    tag_version: str | None = None
 
     # a rolling stability tag like 'stable' or 'oldstable' that will be added first
     stability_tag: str | None = None
@@ -1351,20 +1360,35 @@ class DevelopmentContainer(BaseContainerImage):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        if self.version and not self.tag_version:
+            self.tag_version = self.version
+        if not self.tag_version:
+            raise ValueError("A development container requires a tag_version")
+
+    def prepare_template(self) -> None:
+        """Hook to do delayed expensive work prior template rendering"""
+        super().prepare_template()
         if not self.version:
-            raise ValueError("A language stack container requires a version")
+            raise ValueError("A development container requires a version")
+
+    @property
+    def _registry_prefix(self) -> str:
+        if self.os_version.is_tumbleweed:
+            return "opensuse/bci"
+        return "bci"
 
     @property
     def image_type(self) -> ImageType:
         return ImageType.SLE_BCI
 
     @property
-    def version_label(self) -> str:
+    def oci_version(self) -> str:
         return str(self.version)
 
     @property
     def uid(self) -> str:
-        return f"{self.name}-{self.version}" if self.version_in_uid else self.name
+        return f"{self.name}-{self.tag_version}" if self.version_in_uid else self.name
 
     @property
     def _stability_suffix(self) -> str:
@@ -1417,7 +1441,7 @@ class DevelopmentContainer(BaseContainerImage):
         tags = []
 
         for name in [self.name] + self.additional_names:
-            ver_labels = [self.version_label]
+            ver_labels: list[str] = [self.tag_version]
             if self.stability_tag:
                 ver_labels = [self.stability_tag] + ver_labels
             for ver_label in ver_labels + self.additional_versions:
@@ -1430,33 +1454,35 @@ class DevelopmentContainer(BaseContainerImage):
         return tags
 
     @property
+    def image_ref_name(self) -> str:
+        return f"{self.tag_version}-{self._release_suffix}"
+
+    @property
     def reference(self) -> str:
         return (
-            f"{self.registry}/{self._registry_prefix}/{self.name}"
-            + f":{self.version_label}-{self._release_suffix}"
+            f"{self.registry}/{self._registry_prefix}/{self.name}:{self.image_ref_name}"
         )
 
     @property
     def pretty_reference(self) -> str:
-        return (
-            f"{self.registry}/{self._registry_prefix}/{self.name}:{self.version_label}"
-        )
+        return f"{self.registry}/{self._registry_prefix}/{self.name}:{self.tag_version}"
 
     @property
     def build_version(self) -> str | None:
         build_ver = super().build_version
         if build_ver:
-            # if self.version is a numeric version and not a macro, then
+            container_version: str = self.tag_version
+            # if container_version is a numeric version and not a macro, then
             # version.parse() returns a `Version` object => then we concatenate
             # it with the existing build_version
             # for non PEP440 versions, we'll get an exception and just return
             # the parent's classes build_version
             try:
-                version.parse(str(self.version))
-                stability_suffix = ""
+                version.parse(str(container_version))
+                stability_suffix: str = ""
                 if self._stability_suffix:
                     stability_suffix = "." + self._stability_suffix
-                return f"{build_ver}.{self.version}{stability_suffix}"
+                return f"{build_ver}.{container_version}{stability_suffix}"
             except version.InvalidVersion:
                 return build_ver
         return None
@@ -1464,9 +1490,15 @@ class DevelopmentContainer(BaseContainerImage):
 
 @dataclass
 class ApplicationStackContainer(DevelopmentContainer):
+    def __post_init__(self) -> None:
+        self._min_release_counter = 35
+        super().__post_init__()
+
     @property
     def _registry_prefix(self) -> str:
-        return self._image_properties.application_container_build_tag_prefix
+        if self.os_version.is_tumbleweed:
+            return "opensuse"
+        return "suse"
 
     @property
     def image_type(self) -> ImageType:
@@ -1474,11 +1506,12 @@ class ApplicationStackContainer(DevelopmentContainer):
 
     @property
     def title(self) -> str:
-        return f"{self._image_properties.distribution_base_name} {self.pretty_name}"
+        return f"{self.os_version.distribution_base_name} {self.pretty_name}"
 
     @property
     def eula(self) -> str:
-        if self.is_opensuse:
+        """SLE BCI Application containers are non-redistributable by default."""
+        if self.os_version.is_tumbleweed:
             return "sle-bci"
         return "sle-eula"
 
@@ -1487,8 +1520,10 @@ class ApplicationStackContainer(DevelopmentContainer):
 class OsContainer(BaseContainerImage):
     @staticmethod
     def version_to_container_os_version(os_version: OsVersion) -> str:
-        if os_version in (OsVersion.TUMBLEWEED, OsVersion.BASALT):
+        if os_version == OsVersion.TUMBLEWEED:
             return "latest"
+        if os_version == OsVersion.SLE16_0:
+            return str(os_version)
         return f"15.{os_version}"
 
     @property
@@ -1496,7 +1531,7 @@ class OsContainer(BaseContainerImage):
         return self.name
 
     @property
-    def version_label(self) -> str:
+    def oci_version(self) -> str:
         return "%OS_VERSION_ID_SP%.%RELEASE%"
 
     @property
@@ -1508,23 +1543,32 @@ class OsContainer(BaseContainerImage):
 
     @property
     def build_tags(self) -> list[str]:
-        tags = []
+        tags: list[str] = []
+
         for name in [self.name] + self.additional_names:
             tags += [
                 f"{self._registry_prefix}/bci-{name}:%OS_VERSION_ID_SP%",
-                f"{self._registry_prefix}/bci-{name}:{self.version_label}",
+                f"{self._registry_prefix}/bci-{name}:{self.image_ref_name}",
             ] + (
                 [f"{self._registry_prefix}/bci-{name}:latest"] if self.is_latest else []
             )
         return tags
 
     @property
+    def image_ref_name(self) -> str:
+        return self.oci_version
+
+    @property
     def reference(self) -> str:
-        return f"{self.registry}/{self._registry_prefix}/bci-{self.name}:{self.version_label}"
+        return f"{self.registry}/{self._registry_prefix}/bci-{self.name}:{self.image_ref_name}"
 
     @property
     def pretty_reference(self) -> str:
         return f"{self.registry}/{self._registry_prefix}/bci-{self.name}:{self.os_version.os_version}"
+
+    def prepare_template(self) -> None:
+        """Hook to do delayed expensive work prior template rendering"""
+        pass
 
 
 def generate_disk_size_constraints(size_gb: int) -> str:
@@ -1542,6 +1586,7 @@ def generate_disk_size_constraints(size_gb: int) -> str:
 """
 
 
+from .apache_tomcat import TOMCAT_CONTAINERS  # noqa: E402
 from .appcontainers import ALERTMANAGER_CONTAINERS  # noqa: E402
 from .appcontainers import BLACKBOX_EXPORTER_CONTAINERS  # noqa: E402
 from .appcontainers import GIT_CONTAINERS  # noqa: E402
@@ -1549,13 +1594,11 @@ from .appcontainers import GRAFANA_CONTAINERS  # noqa: E402
 from .appcontainers import HELM_CONTAINERS  # noqa: E402
 from .appcontainers import NGINX_CONTAINERS  # noqa: E402
 from .appcontainers import PCP_CONTAINERS  # noqa: E402
-from .appcontainers import POSTGRES_CONTAINERS  # noqa: E402
 from .appcontainers import PROMETHEUS_CONTAINERS  # noqa: E402
 from .appcontainers import REGISTRY_CONTAINERS  # noqa: E402
 from .appcontainers import THREE_EIGHT_NINE_DS_CONTAINERS  # noqa: E402
-from .appcontainers import TOMCAT_CONTAINERS  # noqa: E402
 from .appcontainers import TRIVY_CONTAINERS  # noqa: E402
-from .basalt_base import BASALT_BASE  # noqa: E402
+from .base import BASE_CONTAINERS  # noqa: E402
 from .basecontainers import BUSYBOX_CONTAINERS  # noqa: E402
 from .basecontainers import FIPS_BASE_CONTAINERS  # noqa: E402
 from .basecontainers import GITEA_RUNNER_CONTAINER  # noqa: E402
@@ -1565,11 +1608,14 @@ from .basecontainers import MICRO_CONTAINERS  # noqa: E402
 from .basecontainers import MINIMAL_CONTAINERS  # noqa: E402
 from .gcc import GCC_CONTAINERS  # noqa: E402
 from .golang import GOLANG_CONTAINERS  # noqa: E402
+from .kiwi import KIWI_CONTAINERS  # noqa: E402
 from .mariadb import MARIADB_CLIENT_CONTAINERS  # noqa: E402
 from .mariadb import MARIADB_CONTAINERS  # noqa: E402
 from .node import NODE_CONTAINERS  # noqa: E402
 from .openjdk import OPENJDK_CONTAINERS  # noqa: E402
 from .php import PHP_CONTAINERS  # noqa: E402
+from .postfix import POSTFIX_CONTAINERS  # noqa: E402
+from .postgres import POSTGRES_CONTAINERS  # noqa: E402
 from .python import PYTHON_3_6_CONTAINERS  # noqa: E402
 from .python import PYTHON_3_11_CONTAINERS  # noqa: E402
 from .python import PYTHON_3_12_CONTAINERS  # noqa: E402
@@ -1582,8 +1628,8 @@ from .spack import SPACK_CONTAINERS  # noqa: E402
 ALL_CONTAINER_IMAGE_NAMES: dict[str, BaseContainerImage] = {
     f"{bci.uid}-{bci.os_version.pretty_print.lower()}": bci
     for bci in (
-        BASALT_BASE,
-        PYTHON_3_12_CONTAINERS,
+        *BASE_CONTAINERS,
+        *PYTHON_3_12_CONTAINERS,
         *PYTHON_3_6_CONTAINERS,
         *PYTHON_3_11_CONTAINERS,
         *PYTHON_TW_CONTAINERS,
@@ -1597,6 +1643,7 @@ ALL_CONTAINER_IMAGE_NAMES: dict[str, BaseContainerImage] = {
         *RUST_CONTAINERS,
         *GIT_CONTAINERS,
         *GOLANG_CONTAINERS,
+        *KIWI_CONTAINERS,
         *RUBY_CONTAINERS,
         *NODE_CONTAINERS,
         *OPENJDK_CONTAINERS,
@@ -1605,6 +1652,7 @@ ALL_CONTAINER_IMAGE_NAMES: dict[str, BaseContainerImage] = {
         *FIPS_BASE_CONTAINERS,
         *MARIADB_CONTAINERS,
         *MARIADB_CLIENT_CONTAINERS,
+        *POSTFIX_CONTAINERS,
         *POSTGRES_CONTAINERS,
         *PROMETHEUS_CONTAINERS,
         *ALERTMANAGER_CONTAINERS,
@@ -1623,7 +1671,7 @@ ALL_CONTAINER_IMAGE_NAMES: dict[str, BaseContainerImage] = {
 
 SORTED_CONTAINER_IMAGE_NAMES = sorted(
     ALL_CONTAINER_IMAGE_NAMES,
-    key=lambda bci: str(ALL_CONTAINER_IMAGE_NAMES[bci].os_version),
+    key=lambda bci: f"{ALL_CONTAINER_IMAGE_NAMES[bci].os_version}-{ALL_CONTAINER_IMAGE_NAMES[bci].name}",
 )
 
 

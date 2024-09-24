@@ -15,28 +15,27 @@ from bci_build.package import SupportLevel
 from bci_build.package import generate_disk_size_constraints
 from bci_build.package.helpers import generate_package_version_check
 from bci_build.package.versions import get_pkg_version
-from bci_build.package.versions import to_major_minor_version
 
 _MARIADB_GOSU = b"""#!/bin/bash
 
 u=$1
 shift
 
-if ! id -u $u > /dev/null 2>&1; then
+if ! id -u "$u" > /dev/null 2>&1; then
     echo "Invalid user: $u"
     exit 1
 fi
 
-setpriv --reuid=$u --regid=$u --clear-groups -- /bin/bash "$@"
+exec setpriv --pdeathsig=keep --reuid="$u" --regid="$u" --clear-groups -- "$@"
 """
 
 MARIADB_CONTAINERS = []
 MARIADB_CLIENT_CONTAINERS = []
 
-for os_version in ALL_NONBASE_OS_VERSIONS:  # + [OsVersion.BASALT]:
-    mariadb_pkg_version = get_pkg_version("mariadb", os_version)
-    mariadb_version = to_major_minor_version(mariadb_pkg_version)
-    if os_version in (OsVersion.BASALT, OsVersion.TUMBLEWEED):
+for os_version in ALL_NONBASE_OS_VERSIONS:
+    mariadb_version = get_pkg_version("mariadb", os_version)
+
+    if os_version in (OsVersion.SLE16_0, OsVersion.TUMBLEWEED):
         prefix = ""
         additional_names = []
     else:
@@ -54,10 +53,10 @@ for os_version in ALL_NONBASE_OS_VERSIONS:  # + [OsVersion.BASALT]:
     # using the replace_using_pkg_version service
     # Although the current version is not checking the patch level, this might
     # change in the future
-    _MARIADB_VERSION_REGEX = "%%mariadb_version%%"
+    _MARIADB_VERSION_PLACEHOLDER = "%%mariadb_version%%"
     docker_entrypoint = re.sub(
         f'echo -n "{mariadb_version}.*-MariaDB"',
-        f'echo -n "{_MARIADB_VERSION_REGEX}-MariaDB"',
+        f'echo -n "{_MARIADB_VERSION_PLACEHOLDER}-MariaDB"',
         docker_entrypoint,
     )
 
@@ -69,21 +68,25 @@ for os_version in ALL_NONBASE_OS_VERSIONS:  # + [OsVersion.BASALT]:
 
     MARIADB_CONTAINERS.append(
         ApplicationStackContainer(
-            package_name=f"{prefix}mariadb-image",
+            name=f"{prefix}mariadb",
+            version=_MARIADB_VERSION_PLACEHOLDER,
+            tag_version=mariadb_version,
             additional_names=additional_names,
             os_version=os_version,
             is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-            name=f"{prefix}mariadb",
-            version=mariadb_version,
             version_in_uid=False,
             pretty_name="MariaDB Server",
             replacements_via_service=[
                 Replacement(
-                    regex_in_build_description=_MARIADB_VERSION_REGEX,
+                    regex_in_build_description=_MARIADB_VERSION_PLACEHOLDER,
                     package_name="mariadb",
                     file_name=_ENTRYPOINT_FNAME,
                     parse_version=ParseVersion.PATCH,
-                )
+                ),
+                Replacement(
+                    regex_in_build_description=_MARIADB_VERSION_PLACEHOLDER,
+                    package_name="mariadb",
+                ),
             ],
             package_list=[
                 "mariadb",
@@ -92,10 +95,15 @@ for os_version in ALL_NONBASE_OS_VERSIONS:  # + [OsVersion.BASALT]:
                 "timezone",
                 "util-linux",
                 "findutils",
+                "zstd",
             ],
             entrypoint=[_ENTRYPOINT_FNAME],
+            license="GPL-2.0-only",
             extra_files={
                 _ENTRYPOINT_FNAME: docker_entrypoint,
+                "LICENSE": (
+                    Path(__file__).parent / "mariadb" / str(mariadb_version) / "LICENSE"
+                ).read_bytes(),
                 "healthcheck.sh": healthcheck,
                 "gosu": _MARIADB_GOSU,
                 "_constraints": generate_disk_size_constraints(11),
@@ -136,18 +144,24 @@ COPY gosu /usr/local/bin/gosu
 
     MARIADB_CLIENT_CONTAINERS.append(
         ApplicationStackContainer(
-            package_name=f"{prefix}mariadb-client-image",
+            name=f"{prefix}mariadb-client",
             os_version=os_version,
             is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
             version_in_uid=False,
-            name=f"{prefix}mariadb-client",
             additional_names=[f"{name}-client" for name in additional_names],
-            version=mariadb_version,
+            version=_MARIADB_VERSION_PLACEHOLDER,
+            tag_version=mariadb_version,
             pretty_name="MariaDB Client",
             support_level=SupportLevel.L3,
             package_list=["mariadb-client"],
             build_recipe_type=BuildType.DOCKER,
             cmd=["mariadb"],
+            replacements_via_service=[
+                Replacement(
+                    regex_in_build_description=_MARIADB_VERSION_PLACEHOLDER,
+                    package_name="mariadb-client",
+                ),
+            ],
             custom_end=version_check_lines,
         )
     )

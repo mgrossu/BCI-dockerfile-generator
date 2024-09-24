@@ -1,6 +1,5 @@
 """Application Containers that are generated with the BCI tooling"""
 
-from itertools import product
 from pathlib import Path
 
 from bci_build.package import ALL_NONBASE_OS_VERSIONS
@@ -16,11 +15,9 @@ from bci_build.package import ParseVersion
 from bci_build.package import Replacement
 from bci_build.package import SupportLevel
 from bci_build.package import _build_tag_prefix
-from bci_build.package import generate_disk_size_constraints
 from bci_build.package.helpers import generate_package_version_check
+from bci_build.package.versions import format_version
 from bci_build.package.versions import get_pkg_version
-from bci_build.package.versions import to_major_minor_version
-from bci_build.package.versions import to_major_version
 
 
 def _envsubst_pkg_name(os_version: OsVersion) -> str:
@@ -43,7 +40,6 @@ PCP_CONTAINERS = [
         name="pcp",
         pretty_name="Performance Co-Pilot (pcp)",
         custom_description="{pretty_name} container {based_on_container}. {podman_only}",
-        package_name="pcp-image",
         from_image=f"{_build_tag_prefix(os_version)}/bci-init:{OsContainer.version_to_container_os_version(os_version)}",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
@@ -51,8 +47,8 @@ PCP_CONTAINERS = [
         version=(pcp_ver := get_pkg_version("pcp", os_version)),
         version_in_uid=False,
         additional_versions=[
-            to_major_minor_version(pcp_ver),
-            to_major_version(pcp_ver),
+            format_version(pcp_ver, ParseVersion.MINOR),
+            format_version(pcp_ver, ParseVersion.MAJOR),
         ],
         replacements_via_service=[
             Replacement(
@@ -101,11 +97,11 @@ _389DS_FILES[_fname] = (Path(__file__).parent / "389-ds" / _fname).read_bytes()
 
 THREE_EIGHT_NINE_DS_CONTAINERS = [
     ApplicationStackContainer(
+        name="389-ds",
         package_name="389-ds-container",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         version_in_uid=False,
-        name="389-ds",
         support_level=SupportLevel.L3,
         maintainer="william.brown@suse.com",
         pretty_name="389 Directory Server",
@@ -140,67 +136,6 @@ HEALTHCHECK --start-period=5m --timeout=5s --interval=5s --retries=2 \
     for os_version in ALL_NONBASE_OS_VERSIONS
 ]
 
-_POSTGRES_ENTRYPOINT = (
-    Path(__file__).parent / "postgres" / "entrypoint.sh"
-).read_bytes()
-_POSTGRES_LICENSE = (Path(__file__).parent / "postgres" / "LICENSE").read_bytes()
-
-# first list the SLE15 versions, then the TW specific versions
-_POSTGRES_MAJOR_VERSIONS = [16, 15, 14] + [13, 12]
-POSTGRES_CONTAINERS = [
-    ApplicationStackContainer(
-        package_name=f"postgres-{ver}-image",
-        os_version=os_version,
-        is_latest=ver == _POSTGRES_MAJOR_VERSIONS[0],
-        name="postgres",
-        pretty_name=f"PostgreSQL {ver}",
-        support_level=SupportLevel.ACC,
-        package_list=[f"postgresql{ver}-server", "findutils"],
-        version=ver,
-        additional_versions=["%%pg_version%%"],
-        entrypoint=["/usr/local/bin/docker-entrypoint.sh"],
-        cmd=["postgres"],
-        env={
-            "LANG": "en_US.utf8",
-            "PG_MAJOR": f"{ver}",
-            "PG_VERSION": "%%pg_version%%",
-            "PGDATA": "/var/lib/pgsql/data",
-        },
-        extra_files={
-            "docker-entrypoint.sh": _POSTGRES_ENTRYPOINT,
-            "LICENSE": _POSTGRES_LICENSE,
-            # prevent ftbfs on workers with a root partition with 4GB
-            "_constraints": generate_disk_size_constraints(8),
-        },
-        replacements_via_service=[
-            Replacement(
-                regex_in_build_description="%%pg_version%%",
-                package_name=f"postgresql{ver}-server",
-                parse_version=ParseVersion.MINOR,
-            )
-        ],
-        volumes=["$PGDATA"],
-        exposes_tcp=[5432],
-        custom_end=rf"""COPY docker-entrypoint.sh /usr/local/bin/
-{DOCKERFILE_RUN} chmod +x /usr/local/bin/docker-entrypoint.sh; \
-    sed -i -e 's/exec gosu postgres "/exec setpriv --reuid=postgres --regid=postgres --clear-groups -- "/g' /usr/local/bin/docker-entrypoint.sh; \
-    mkdir /docker-entrypoint-initdb.d; \
-    install -m 1775 -o postgres -g postgres -d /run/postgresql; \
-    install -d -m 0700 -o postgres -g postgres $PGDATA; \
-    sed -ri "s|^#?(listen_addresses)\s*=\s*\S+.*|\1 = '*'|" /usr/share/postgresql{ver}/postgresql.conf.sample
-
-STOPSIGNAL SIGINT
-HEALTHCHECK --interval=10s --start-period=10s --timeout=5s \
-    CMD pg_isready -U ${{POSTGRES_USER:-postgres}} -h localhost -p 5432
-""",
-    )
-    for ver, os_version in (
-        [(15, variant) for variant in (OsVersion.SP5, OsVersion.TUMBLEWEED)]
-        + [(16, variant) for variant in (OsVersion.SP6, OsVersion.TUMBLEWEED)]
-    )
-    + [(pg_ver, OsVersion.TUMBLEWEED) for pg_ver in (14, 13, 12)]
-]
-
 
 def _generate_prometheus_family_healthcheck(port: int) -> str:
     return rf"""HEALTHCHECK --interval=5s --timeout=5s --retries=5 \
@@ -212,11 +147,10 @@ _PROMETHEUS_PACKAGE_NAME = "golang-github-prometheus-prometheus"
 _PROMETHEUS_PORT = 9090
 PROMETHEUS_CONTAINERS = [
     ApplicationStackContainer(
-        package_name="prometheus-image",
-        os_version=os_version,
-        is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         name="prometheus",
         pretty_name="Prometheus",
+        os_version=os_version,
+        is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         package_list=[_PROMETHEUS_PACKAGE_NAME, "curl"],
         version="%%prometheus_patch_version%%",
         additional_versions=[
@@ -244,10 +178,9 @@ _ALERTMANAGER_PACKAGE_NAME = "golang-github-prometheus-alertmanager"
 _ALERTMANAGER_PORT = 9093
 ALERTMANAGER_CONTAINERS = [
     ApplicationStackContainer(
-        package_name="alertmanager-image",
+        name="alertmanager",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        name="alertmanager",
         pretty_name="Alertmanager",
         package_list=[_ALERTMANAGER_PACKAGE_NAME, "curl"],
         version="%%alertmanager_patch_version%%",
@@ -273,10 +206,9 @@ _BLACKBOX_EXPORTER_PACKAGE_NAME = "prometheus-blackbox_exporter"
 _BLACKBOX_PORT = 9115
 BLACKBOX_EXPORTER_CONTAINERS = [
     ApplicationStackContainer(
-        package_name="blackbox_exporter-image",
+        name="blackbox_exporter",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        name="blackbox_exporter",
         pretty_name="Blackbox Exporter",
         package_list=[_BLACKBOX_EXPORTER_PACKAGE_NAME, "curl"],
         version="%%blackbox_exporter_patch_version%%",
@@ -307,12 +239,11 @@ for filename in ("run.sh", "LICENSE"):
 _GRAFANA_PACKAGE_NAME = "grafana"
 GRAFANA_CONTAINERS = [
     ApplicationStackContainer(
-        package_name="grafana-image",
+        name="grafana",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        name="grafana",
         pretty_name="Grafana",
-        license="Apache-2.0",
+        license="AGPL-3.0-only",
         package_list=[_GRAFANA_PACKAGE_NAME],
         version="%%grafana_patch_version%%",
         additional_versions=["%%grafana_minor_version%%", "%%grafana_major_version%%"],
@@ -355,7 +286,7 @@ for filename in (
 
 
 def _get_nginx_kwargs(os_version: OsVersion):
-    nginx_version = to_major_minor_version(get_pkg_version("nginx", os_version))
+    nginx_version = get_pkg_version("nginx", os_version)
 
     version_check_lines = generate_package_version_check("nginx", nginx_version)
 
@@ -398,7 +329,6 @@ STOPSIGNAL SIGQUIT
 NGINX_CONTAINERS = [
     ApplicationStackContainer(
         name="rmt-nginx",
-        package_name="rmt-nginx-image",
         pretty_name="NGINX for SUSE RMT",
         **_get_nginx_kwargs(os_version),
     )
@@ -406,7 +336,6 @@ NGINX_CONTAINERS = [
 ] + [
     ApplicationStackContainer(
         name="nginx",
-        package_name="nginx-image",
         pretty_name="NGINX",
         custom_description="NGINX open source all-in-one load balancer, content cache and web server {based_on_container}.",
         **_get_nginx_kwargs(os_version),
@@ -419,20 +348,30 @@ GIT_CONTAINERS = [
         name="git",
         os_version=os_version,
         support_level=SupportLevel.L3,
-        package_name="git-image",
         pretty_name=f"{os_version.pretty_os_version_no_dash} with Git",
         custom_description="A micro environment with Git {based_on_container}.",
         from_image=f"{_build_tag_prefix(os_version)}/bci-micro:{OsContainer.version_to_container_os_version(os_version)}",
         build_recipe_type=BuildType.KIWI,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
         version="%%git_version%%",
+        tag_version="%%git_minor_version%%",
+        additional_versions=["%%git_major_version%%", "%%git_version%%"],
         version_in_uid=False,
         replacements_via_service=[
             Replacement(
                 regex_in_build_description="%%git_version%%",
                 package_name="git-core",
+            ),
+            Replacement(
+                regex_in_build_description="%%git_major_version%%",
+                package_name="git-core",
+                parse_version=ParseVersion.MAJOR,
+            ),
+            Replacement(
+                regex_in_build_description="%%git_minor_version%%",
+                package_name="git-core",
                 parse_version=ParseVersion.MINOR,
-            )
+            ),
         ],
         license="GPL-2.0-only",
         package_list=[
@@ -456,8 +395,8 @@ GIT_CONTAINERS = [
 REGISTRY_CONTAINERS = [
     ApplicationStackContainer(
         name="registry",
-        pretty_name="OCI Container Registry (Distribution)",
         package_name="distribution-image",
+        pretty_name="OCI Container Registry (Distribution)",
         from_image=f"{_build_tag_prefix(os_version)}/bci-micro:{OsContainer.version_to_container_os_version(os_version)}",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
@@ -497,11 +436,10 @@ HELM_CONTAINERS = [
     ApplicationStackContainer(
         name="helm",
         pretty_name="Kubernetes Package Manager",
-        package_name="helm-image",
         from_image=f"{_build_tag_prefix(os_version)}/bci-micro:{OsContainer.version_to_container_os_version(os_version)}",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
-        version=to_major_minor_version(get_pkg_version("helm", os_version)),
+        version=get_pkg_version("helm", os_version),
         version_in_uid=False,
         license="Apache-2.0",
         package_list=[
@@ -524,7 +462,6 @@ TRIVY_CONTAINERS = [
     ApplicationStackContainer(
         name="trivy",
         pretty_name="Container Vulnerability Scanner",
-        package_name="trivy-image",
         from_image=f"{_build_tag_prefix(os_version)}/bci-micro:{OsContainer.version_to_container_os_version(os_version)}",
         os_version=os_version,
         is_latest=os_version in CAN_BE_LATEST_OS_VERSION,
@@ -550,68 +487,4 @@ TRIVY_CONTAINERS = [
         build_recipe_type=BuildType.KIWI,
     )
     for os_version in (OsVersion.TUMBLEWEED,)
-]
-
-_TOMCAT_VERSIONS = [9, 10]
-assert _TOMCAT_VERSIONS == sorted(_TOMCAT_VERSIONS)
-
-TOMCAT_CONTAINERS = [
-    ApplicationStackContainer(
-        name="tomcat",
-        pretty_name=f"Apache Tomcat {tomcat_major}",
-        package_name=f"tomcat-{tomcat_major}-image",
-        os_version=os_version,
-        is_latest=(
-            (os_version in CAN_BE_LATEST_OS_VERSION)
-            and tomcat_major == _TOMCAT_VERSIONS[-1]
-        ),
-        version=tomcat_major,
-        additional_versions=["%%tomcat_version%%", "%%tomcat_minor%%"],
-        package_list=[
-            tomcat_pkg := (
-                "tomcat"
-                if tomcat_major == _TOMCAT_VERSIONS[0]
-                else f"tomcat{tomcat_major}"
-            )
-        ]
-        + (
-            ["java-21-openjdk", "java-21-openjdk-headless"]
-            if os_version == OsVersion.SP6
-            else []
-        ),
-        replacements_via_service=[
-            Replacement(
-                regex_in_build_description="%%tomcat_version%%", package_name=tomcat_pkg
-            ),
-            Replacement(
-                regex_in_build_description="%%tomcat_minor%%",
-                package_name=tomcat_pkg,
-                parse_version=ParseVersion.MINOR,
-            ),
-        ],
-        cmd=[
-            f"/usr/{'libexec' if os_version in( OsVersion.TUMBLEWEED, OsVersion.BASALT) else 'lib'}/tomcat/server",
-            "start",
-        ],
-        exposes_tcp=[8080],
-        env={
-            "TOMCAT_MAJOR": tomcat_major,
-            "TOMCAT_VERSION": "%%tomcat_version%%",
-            "CATALINA_HOME": (_CATALINA_HOME := "/usr/share/tomcat"),
-            "CATALINA_BASE": _CATALINA_HOME,
-            "PATH": f"{_CATALINA_HOME}/bin:$PATH",
-        },
-        custom_end=rf"""{DOCKERFILE_RUN} mkdir -p /var/log/tomcat; chown --recursive tomcat:tomcat /var/log/tomcat;
-{DOCKERFILE_RUN} \
-    sed -i /etc/tomcat/logging.properties \
-        -e 's|org\.apache\.catalina\.core\.ContainerBase\.\[Catalina\]\.\[localhost\]\.handlers =.*|org.apache.catalina.core.ContainerBase.[Catalina].[localhost].handlers = java.util.logging.ConsoleHandler|' \
-        -e 's|org\.apache\.catalina\.core\.ContainerBase\.\[Catalina\]\.\[localhost\]\.\[/manager\]\.handlers =.*|org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/manager].handlers = java.util.logging.ConsoleHandler|' \
-        -e 's|org\.apache\.catalina\.core\.ContainerBase\.\[Catalina\]\.\[localhost\]\.\[/host-manager\]\.handlers =.*|org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/host-manager].handlers = java.util.logging.ConsoleHandler|'
-
-WORKDIR $CATALINA_HOME
-""",
-        entrypoint_user="tomcat",
-        logo_url="https://tomcat.apache.org/res/images/tomcat.png",
-    )
-    for tomcat_major, os_version in product(_TOMCAT_VERSIONS, ALL_NONBASE_OS_VERSIONS)
 ]
